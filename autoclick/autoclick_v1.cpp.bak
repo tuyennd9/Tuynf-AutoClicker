@@ -1,0 +1,981 @@
+﻿#include "resource.h"
+#define UNICODE
+#define _UNICODE
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <commctrl.h>
+#include <dwmapi.h>
+#include <string>
+#include <thread>
+#include <atomic>
+#include <chrono>
+#include <fstream>
+#include <sstream>
+
+#pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "dwmapi.lib")
+#pragma comment(linker,"\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
+
+// Control IDs
+#define IDC_BTN_TYPE_CLICK   100
+#define IDC_BTN_TYPE_HOLD    101
+#define IDC_BTN_MODE_LEFT    102
+#define IDC_BTN_MODE_RIGHT   103
+#define IDC_BTN_MODE_ALT     104
+#define IDC_BTN_MINUS        105
+#define IDC_BTN_PLUS         106
+#define IDC_EDIT_CPS         107
+#define IDC_BTN_BIND_TOGGLE  108
+#define IDC_BTN_BIND_EXIT    109
+#define IDC_LBL_STATUS       110
+#define IDC_BTN_PAUSE_MINUS  111
+#define IDC_BTN_PAUSE_PLUS   112
+#define IDC_EDIT_PAUSE       113
+
+// Static Label IDs
+#define IDL_MODE   201
+#define IDL_TARGET 202
+#define IDL_CPS    203
+#define IDL_KEYS   204
+#define IDL_PAUSE  205
+
+#define CUSTOM_KEY_XBUTTON1  0x101
+#define CUSTOM_KEY_XBUTTON2  0x102
+
+// App States
+std::atomic<bool>      g_Running(false);
+std::atomic<bool>      g_AppActive(true);
+std::atomic<double>    g_Cps(10.0);
+std::atomic<int>       g_ClickMode(0);  // 0: Left, 1: Right, 2: Alternate
+std::atomic<int>       g_ActionType(0); // 0: Auto Click, 1: Hold Key
+std::atomic<long long> g_ClickCount(0);
+std::atomic<double>    g_HoldDuration(1.0); // seconds to hold
+std::atomic<double>    g_HoldPause(0.1);    // seconds to pause between holds
+
+std::atomic<int> g_ToggleKey(VK_F8);
+std::atomic<int> g_ExitKey(VK_F9);
+
+int g_BindingTarget = 0; // 1: Toggle, 2: Exit
+HHOOK g_hKbdHook = NULL;
+HHOOK g_hMouseHook = NULL;
+HWND g_hWnd = NULL;
+HWND g_hHoveredBtn = NULL;
+bool g_SettingsReady = false;
+
+HFONT g_hFontTitle = NULL;
+HFONT g_hFontBtn = NULL;
+HFONT g_hFontEdit = NULL;
+HFONT g_hFontStatus = NULL;
+float g_UiScale = 0.0f;
+float g_ScaleX = 1.0f;
+float g_ScaleY = 1.0f;
+
+std::wstring GetSettingsPath() {
+    wchar_t exePath[MAX_PATH];
+    GetModuleFileNameW(NULL, exePath, MAX_PATH);
+    std::wstring path(exePath);
+    size_t pos = path.find_last_of(L"\\/");
+    if (pos != std::wstring::npos) path = path.substr(0, pos + 1);
+    return path + L"settings.ini";
+}
+
+void LoadSettings() {
+    std::wstring path = GetSettingsPath();
+    std::wifstream file(path);
+    if (!file.is_open()) return;
+
+    std::wstring line;
+    while (std::getline(file, line)) {
+        size_t pos = line.find(L'=');
+        if (pos == std::wstring::npos) continue;
+        std::wstring key = line.substr(0, pos);
+        std::wstring value = line.substr(pos + 1);
+
+        if (key == L"Cps") g_Cps = std::stod(value);
+        else if (key == L"ClickMode") g_ClickMode = std::stoi(value);
+        else if (key == L"ActionType") g_ActionType = std::stoi(value);
+        else if (key == L"ToggleKey") g_ToggleKey = std::stoi(value);
+        else if (key == L"ExitKey") g_ExitKey = std::stoi(value);
+        else if (key == L"HoldDuration") g_HoldDuration = std::stod(value);
+        else if (key == L"HoldPause") g_HoldPause = std::stod(value);
+    }
+}
+
+void SaveSettings() {
+    if (!g_SettingsReady) return;
+    std::wstring path = GetSettingsPath();
+    std::wofstream file(path);
+    if (!file.is_open()) return;
+
+    file << L"Cps=" << std::to_wstring(g_Cps.load()) << L"\n";
+    file << L"ClickMode=" << std::to_wstring(g_ClickMode.load()) << L"\n";
+    file << L"ActionType=" << std::to_wstring(g_ActionType.load()) << L"\n";
+    file << L"ToggleKey=" << std::to_wstring(g_ToggleKey.load()) << L"\n";
+    file << L"ExitKey=" << std::to_wstring(g_ExitKey.load()) << L"\n";
+    file << L"HoldDuration=" << std::to_wstring(g_HoldDuration.load()) << L"\n";
+    file << L"HoldPause=" << std::to_wstring(g_HoldPause.load()) << L"\n";
+}
+
+// Palette Colors
+const COLORREF CLR_BG = RGB(18, 18, 20);
+const COLORREF CLR_BTN_NORMAL = RGB(32, 32, 36);
+const COLORREF CLR_BTN_HOVER = RGB(46, 46, 52);
+const COLORREF CLR_BTN_PRESS = RGB(60, 60, 68);
+const COLORREF CLR_ACCENT = RGB(139, 92, 246);   // Violet 500
+const COLORREF CLR_ACCENT_HOV = RGB(167, 139, 250);
+const COLORREF CLR_BINDING = RGB(234, 179, 8);
+const COLORREF CLR_TEXT = RGB(244, 244, 245);
+const COLORREF CLR_TEXT_MUTED = RGB(140, 140, 148);
+const COLORREF CLR_DISABLED = RGB(50, 50, 56);
+const COLORREF CLR_STATUS_RUN = RGB(16, 185, 129);
+
+std::wstring GetKeyDisplayName(int vkCode) {
+    if (vkCode == CUSTOM_KEY_XBUTTON1) return L"Mouse 4";
+    if (vkCode == CUSTOM_KEY_XBUTTON2) return L"Mouse 5";
+    if (vkCode >= VK_F1 && vkCode <= VK_F24) return L"F" + std::to_wstring(vkCode - VK_F1 + 1);
+    if (vkCode == VK_ESCAPE) return L"ESC";
+    if (vkCode == VK_SPACE)  return L"SPACE";
+
+    UINT scanCode = MapVirtualKeyW(vkCode, MAPVK_VK_TO_VSC);
+    wchar_t name[64] = { 0 };
+    if (GetKeyNameTextW(scanCode << 16, name, 64) > 0) return std::wstring(name);
+    return L"Key " + std::to_wstring(vkCode);
+}
+
+static std::wstring FormatSeconds(double v) {
+    wchar_t buf[32];
+    swprintf_s(buf, L"%.1f", v);
+    std::wstring s(buf);
+    if (s.size() >= 2 && s.substr(s.size() - 2) == L".0")
+        s = s.substr(0, s.size() - 2);
+    return s;
+}
+
+void UpdateStatusUI() {
+    if (!g_hWnd) return;
+
+    HWND hToggleBtn = GetDlgItem(g_hWnd, IDC_BTN_BIND_TOGGLE);
+    if (g_BindingTarget == 1) SetWindowTextW(hToggleBtn, L"Press any key...");
+    else SetWindowTextW(hToggleBtn, (L"Toggle:  [ " + GetKeyDisplayName(g_ToggleKey) + L" ]").c_str());
+
+    HWND hExitBtn = GetDlgItem(g_hWnd, IDC_BTN_BIND_EXIT);
+    if (g_BindingTarget == 2) SetWindowTextW(hExitBtn, L"Press any key...");
+    else SetWindowTextW(hExitBtn, (L"Exit:  [ " + GetKeyDisplayName(g_ExitKey) + L" ]").c_str());
+
+    // Main value edit (CPS or Hold Duration depending on mode)
+    HWND hEditCps = GetDlgItem(g_hWnd, IDC_EDIT_CPS);
+    if (GetFocus() != hEditCps) {
+        double mainVal = (g_ActionType == 1) ? g_HoldDuration.load() : g_Cps.load();
+        SetWindowTextW(hEditCps, FormatSeconds(mainVal).c_str());
+    }
+
+    // Pause edit (only meaningful in hold mode)
+    HWND hEditPause = GetDlgItem(g_hWnd, IDC_EDIT_PAUSE);
+    if (hEditPause && GetFocus() != hEditPause) {
+        SetWindowTextW(hEditPause, FormatSeconds(g_HoldPause.load()).c_str());
+    }
+
+    HWND hStatus = GetDlgItem(g_hWnd, IDC_LBL_STATUS);
+    std::wstring statusText;
+    if (g_ActionType == 0) {
+        statusText = (g_Running ? L"● RUNNING" : L"○ STOPPED") + std::wstring(L"   |   Clicks: ") + std::to_wstring(g_ClickCount.load());
+    }
+    else {
+        statusText = g_Running ? L"● HOLDING" : L"○ READY TO HOLD";
+    }
+    SetWindowTextW(hStatus, statusText.c_str());
+
+    RedrawWindow(g_hWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+}
+
+void ClickerThread() {
+    bool alternateToggle = false;
+    bool isHolding = false;
+    int currentHoldMode = 0;
+
+    while (g_AppActive) {
+        if (g_Running) {
+            if (g_ActionType == 0) {
+                double cps = g_Cps.load();
+                if (cps <= 0.0001) cps = 0.1;
+
+                long long intervalUs = static_cast<long long>(1000000.0 / cps);
+                INPUT input = { 0 };
+                input.type = INPUT_MOUSE;
+
+                int mode = g_ClickMode.load();
+                if (mode == 0) {
+                    input.mi.dwFlags = MOUSEEVENTF_LEFTDOWN; SendInput(1, &input, sizeof(INPUT)); Sleep(2);
+                    input.mi.dwFlags = MOUSEEVENTF_LEFTUP; SendInput(1, &input, sizeof(INPUT));
+                }
+                else if (mode == 1) {
+                    input.mi.dwFlags = MOUSEEVENTF_RIGHTDOWN; SendInput(1, &input, sizeof(INPUT)); Sleep(2);
+                    input.mi.dwFlags = MOUSEEVENTF_RIGHTUP; SendInput(1, &input, sizeof(INPUT));
+                }
+                else if (mode == 2) {
+                    input.mi.dwFlags = alternateToggle ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_LEFTDOWN;
+                    SendInput(1, &input, sizeof(INPUT)); Sleep(2);
+                    input.mi.dwFlags = alternateToggle ? MOUSEEVENTF_RIGHTUP : MOUSEEVENTF_LEFTUP;
+                    SendInput(1, &input, sizeof(INPUT));
+                    alternateToggle = !alternateToggle;
+                }
+
+                g_ClickCount++;
+                if (g_ClickCount % 3 == 0) PostMessageW(g_hWnd, WM_USER + 1, 0, 0);
+
+                long long sleepUs = intervalUs > 2000 ? intervalUs - 2000 : 500;
+                auto startTime = std::chrono::steady_clock::now();
+                while (g_Running && g_AppActive) {
+                    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - startTime).count();
+                    if (elapsed >= sleepUs) break;
+                    if (sleepUs - elapsed > 20000) std::this_thread::sleep_for(std::chrono::milliseconds(15));
+                    else std::this_thread::yield();
+                }
+            }
+            else {
+                // Hold mode: hold for HoldDuration sec, release, pause for HoldPause sec, repeat
+                if (!isHolding) {
+                    INPUT input = { 0 };
+                    input.type = INPUT_MOUSE;
+                    currentHoldMode = g_ClickMode.load();
+                    if (currentHoldMode == 0 || currentHoldMode == 2) input.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+                    else input.mi.dwFlags = MOUSEEVENTF_RIGHTDOWN;
+                    SendInput(1, &input, sizeof(INPUT));
+                    isHolding = true;
+                    g_ClickCount++;
+                    PostMessageW(g_hWnd, WM_USER + 1, 0, 0);
+
+                    // Wait for hold duration
+                    double holdSec = g_HoldDuration.load();
+                    if (holdSec < 0.05) holdSec = 0.05;
+                    auto holdStart = std::chrono::steady_clock::now();
+                    while (g_Running && g_AppActive) {
+                        double elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(
+                            std::chrono::steady_clock::now() - holdStart).count();
+                        if (elapsed >= holdSec) break;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    }
+
+                    // Release
+                    if (currentHoldMode == 0 || currentHoldMode == 2) input.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+                    else input.mi.dwFlags = MOUSEEVENTF_RIGHTUP;
+                    SendInput(1, &input, sizeof(INPUT));
+                    isHolding = false;
+                    PostMessageW(g_hWnd, WM_USER + 1, 0, 0);
+
+                    // Pause before next hold (only if still running)
+                    if (g_Running && g_AppActive) {
+                        double pauseSec = g_HoldPause.load();
+                        if (pauseSec > 0.001) {
+                            auto pauseStart = std::chrono::steady_clock::now();
+                            while (g_Running && g_AppActive) {
+                                double elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(
+                                    std::chrono::steady_clock::now() - pauseStart).count();
+                                if (elapsed >= pauseSec) break;
+                                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                            }
+                        }
+                    }
+                }
+                else {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                }
+            }
+        }
+        else {
+            if (isHolding) {
+                INPUT input = { 0 };
+                input.type = INPUT_MOUSE;
+                if (currentHoldMode == 0 || currentHoldMode == 2) input.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+                else input.mi.dwFlags = MOUSEEVENTF_RIGHTUP;
+                SendInput(1, &input, sizeof(INPUT));
+                isHolding = false;
+                PostMessageW(g_hWnd, WM_USER + 1, 0, 0);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+
+    if (isHolding) {
+        INPUT input = { 0 };
+        input.type = INPUT_MOUSE;
+        if (currentHoldMode == 0 || currentHoldMode == 2) input.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+        else input.mi.dwFlags = MOUSEEVENTF_RIGHTUP;
+        SendInput(1, &input, sizeof(INPUT));
+    }
+}
+
+void ProcessKeyTrigger(int vkCode) {
+    if (g_BindingTarget == 1) {
+        g_ToggleKey = vkCode;
+        g_BindingTarget = 0;
+        UpdateStatusUI();
+        SaveSettings();
+        return;
+    }
+    if (g_BindingTarget == 2) {
+        g_ExitKey = vkCode;
+        g_BindingTarget = 0;
+        UpdateStatusUI();
+        SaveSettings();
+        return;
+    }
+
+    if (vkCode == g_ToggleKey) {
+        g_Running = !g_Running;
+        UpdateStatusUI();
+    }
+    else if (vkCode == g_ExitKey) {
+        g_Running = false;
+        g_AppActive = false;
+        PostMessageW(g_hWnd, WM_CLOSE, 0, 0);
+    }
+}
+
+LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
+        ProcessKeyTrigger(((KBDLLHOOKSTRUCT*)lParam)->vkCode);
+    }
+    return CallNextHookEx(g_hKbdHook, nCode, wParam, lParam);
+}
+
+LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION && wParam == WM_XBUTTONDOWN) {
+        WORD btn = HIWORD(((MSLLHOOKSTRUCT*)lParam)->mouseData);
+        if (btn == XBUTTON1) ProcessKeyTrigger(CUSTOM_KEY_XBUTTON1);
+        else if (btn == XBUTTON2) ProcessKeyTrigger(CUSTOM_KEY_XBUTTON2);
+    }
+    return CallNextHookEx(g_hMouseHook, nCode, wParam, lParam);
+}
+
+#define IDT_REPEAT_BUTTON 1
+#define REPEAT_INITIAL_DELAY 350
+#define REPEAT_START_INTERVAL 150.0f
+#define REPEAT_MIN_INTERVAL   20.0f
+#define REPEAT_ACCELERATION   0.9f
+static bool g_RepeatConsumed = false;
+static float g_RepeatInterval = REPEAT_START_INTERVAL;
+
+static bool IsRepeatableButton(int id) {
+    return id == IDC_BTN_MINUS || id == IDC_BTN_PLUS ||
+           id == IDC_BTN_PAUSE_MINUS || id == IDC_BTN_PAUSE_PLUS;
+}
+
+static void StepValue(int id) {
+    if (g_ActionType == 0 && (id == IDC_BTN_PAUSE_MINUS || id == IDC_BTN_PAUSE_PLUS))
+        return;
+
+    if (g_hWnd) SetFocus(g_hWnd);
+
+    if (id == IDC_BTN_MINUS || id == IDC_BTN_PLUS) {
+        if (g_ActionType == 0) {
+            // Click mode: adjust CPS
+            double c = g_Cps.load();
+            if (id == IDC_BTN_MINUS) {
+                if (c > 1.0) c -= 1.0;
+                else if (c > 0.1) c = 0.1;
+            }
+            else {
+                c += 1.0;
+            }
+            g_Cps = c;
+        }
+        else {
+            // Hold mode: adjust hold duration
+            double d = g_HoldDuration.load();
+            if (id == IDC_BTN_MINUS) {
+                if (d > 0.6) d -= 0.5;
+                else d = 0.1;
+            }
+            else {
+                d += 0.5;
+            }
+            g_HoldDuration = d;
+        }
+    }
+    else {
+        // Hold pause
+        double p = g_HoldPause.load();
+        if (id == IDC_BTN_PAUSE_MINUS) {
+            if (p > 0.2) p -= 0.1;
+            else p = 0.0;
+        }
+        else {
+            p += 0.1;
+        }
+        g_HoldPause = p;
+    }
+
+    UpdateStatusUI();
+    SaveSettings();
+}
+
+LRESULT CALLBACK ButtonSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR, DWORD_PTR) {
+    const int id = GetDlgCtrlID(hWnd);
+
+    switch (uMsg) {
+    case WM_MOUSEMOVE:
+        if (g_hHoveredBtn != hWnd) {
+            g_hHoveredBtn = hWnd;
+            InvalidateRect(hWnd, NULL, FALSE);
+            TRACKMOUSEEVENT tme = { sizeof(TRACKMOUSEEVENT), TME_LEAVE, hWnd, 0 };
+            TrackMouseEvent(&tme);
+        }
+        break;
+    case WM_MOUSELEAVE:
+        if (g_hHoveredBtn == hWnd) {
+            g_hHoveredBtn = NULL;
+            InvalidateRect(hWnd, NULL, FALSE);
+        }
+        break;
+    case WM_LBUTTONDOWN:
+        if (IsRepeatableButton(id))
+            g_RepeatConsumed = true;
+
+        if (IsRepeatableButton(id) &&
+            !(g_ActionType == 0 && (id == IDC_BTN_PAUSE_MINUS || id == IDC_BTN_PAUSE_PLUS)))
+        {
+            g_RepeatInterval = REPEAT_START_INTERVAL;
+            SetTimer(hWnd, IDT_REPEAT_BUTTON, REPEAT_INITIAL_DELAY, NULL);
+        }
+        break;
+    case WM_TIMER:
+        if (wParam == IDT_REPEAT_BUTTON) {
+            StepValue(id);
+
+            // Speed up the longer the button is held down
+            g_RepeatInterval *= REPEAT_ACCELERATION;
+            if (g_RepeatInterval < REPEAT_MIN_INTERVAL)
+                g_RepeatInterval = REPEAT_MIN_INTERVAL;
+
+            SetTimer(hWnd, IDT_REPEAT_BUTTON, (UINT)g_RepeatInterval, NULL);
+            return 0;
+        }
+        break;
+    case WM_LBUTTONUP:
+    case WM_CAPTURECHANGED:
+    case WM_NCDESTROY:
+        KillTimer(hWnd, IDT_REPEAT_BUTTON);
+        break;
+    }
+
+    const LRESULT result = DefSubclassProc(hWnd, uMsg, wParam, lParam);
+    if (uMsg == WM_LBUTTONUP && IsRepeatableButton(id))
+        g_RepeatConsumed = false;
+    return result;
+}
+
+static HFONT MakeUiFont(int pt, float scale, int weight) {
+    return CreateFontW((int)(pt * scale + 0.5f), 0, 0, 0, weight, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH, L"Segoe UI");
+}
+
+static void RebuildFonts(HWND hWnd, float scale) {
+    if (hWnd == NULL)
+        return;
+
+    const float diff = scale - g_UiScale;
+    if (g_hFontBtn != NULL && diff < 0.05f && diff > -0.05f)
+        return;
+
+    HFONT oldTitle = g_hFontTitle;
+    HFONT oldBtn = g_hFontBtn;
+    HFONT oldEdit = g_hFontEdit;
+    HFONT oldStatus = g_hFontStatus;
+
+    g_UiScale = scale;
+    g_hFontTitle = MakeUiFont(13, scale, FW_BOLD);
+    g_hFontBtn = MakeUiFont(14, scale, FW_SEMIBOLD);
+    g_hFontEdit = MakeUiFont(20, scale, FW_BOLD);
+    g_hFontStatus = MakeUiFont(15, scale, FW_BOLD);
+
+    EnumChildWindows(hWnd, [](HWND hChild, LPARAM) -> BOOL {
+        wchar_t cls[32] = { 0 };
+        GetClassNameW(hChild, cls, 32);
+        const int id = GetDlgCtrlID(hChild);
+
+        HFONT font = g_hFontBtn;
+        if (wcscmp(cls, L"Edit") == 0) font = g_hFontEdit;
+        else if (wcscmp(cls, L"Static") == 0) font = (id == IDC_LBL_STATUS) ? g_hFontStatus : g_hFontTitle;
+
+        SendMessageW(hChild, WM_SETFONT, (WPARAM)font, TRUE);
+        return TRUE;
+    }, 0);
+
+    if (oldTitle) DeleteObject(oldTitle);
+    if (oldBtn) DeleteObject(oldBtn);
+    if (oldEdit) DeleteObject(oldEdit);
+    if (oldStatus) DeleteObject(oldStatus);
+}
+
+static void ApplyLayout(HWND hWnd, int cx, int cy) {
+    if (hWnd == NULL || cx <= 0 || cy <= 0)
+        return;
+
+    const bool holdMode = (g_ActionType == 1);
+    const int designW = 340;
+    const int designH = holdMode ? 363 : 295;
+    const int pad = 20;
+
+    float scaleX = (float)(cx - 2 * pad) / designW;
+    float scaleY = (float)(cy - 2 * pad) / designH;
+    if (scaleX < 1.0f) scaleX = 1.0f;
+    if (scaleY < 1.0f) scaleY = 1.0f;
+    if (scaleX > 4.0f) scaleX = 4.0f;
+    if (scaleY > 2.5f) scaleY = 2.5f;
+
+    g_ScaleX = scaleX;
+    g_ScaleY = scaleY;
+
+    RebuildFonts(hWnd, scaleX < scaleY ? scaleX : scaleY);
+
+    const int oX = (cx - (int)(designW * scaleX)) / 2;
+    const int oY = (cy - (int)(designH * scaleY)) / 2;
+
+    auto pos = [&](int id, int x, int y, int w, int h, bool visible = true) {
+        HWND hCtl = GetDlgItem(hWnd, id);
+        if (!hCtl) return;
+        ShowWindow(hCtl, visible ? SW_SHOW : SW_HIDE);
+        if (visible)
+            SetWindowPos(hCtl, NULL,
+                oX + (int)(x * scaleX), oY + (int)(y * scaleY),
+                (int)(w * scaleX), (int)(h * scaleY), SWP_NOZORDER);
+    };
+
+    pos(IDL_MODE, 0, 0, designW, 16);
+    pos(IDC_BTN_TYPE_CLICK, 0, 20, 165, 32);
+    pos(IDC_BTN_TYPE_HOLD, 175, 20, 165, 32);
+
+    pos(IDL_TARGET, 0, 68, designW, 16);
+    pos(IDC_BTN_MODE_LEFT, 0, 88, 108, 32);
+    pos(IDC_BTN_MODE_RIGHT, 116, 88, 108, 32);
+    pos(IDC_BTN_MODE_ALT, 232, 88, 108, 32);
+
+    // Compact [-] / [+] with a wide value box between them.
+    pos(IDL_CPS, 0, 136, designW, 16);
+    pos(IDC_BTN_MINUS, 0, 156, 60, 32);
+    pos(IDC_EDIT_CPS, 73, 159, 194, 26);
+    pos(IDC_BTN_PLUS, 280, 156, 60, 32);
+
+    pos(IDL_PAUSE, 0, 204, designW, 16, holdMode);
+    pos(IDC_BTN_PAUSE_MINUS, 0, 224, 60, 32, holdMode);
+    pos(IDC_EDIT_PAUSE, 73, 227, 194, 26, holdMode);
+    pos(IDC_BTN_PAUSE_PLUS, 280, 224, 60, 32, holdMode);
+
+    const int keysY = holdMode ? 272 : 204;
+    pos(IDL_KEYS, 0, keysY, designW, 16);
+    pos(IDC_BTN_BIND_TOGGLE, 0, keysY + 20, 165, 32);
+    pos(IDC_BTN_BIND_EXIT, 175, keysY + 20, 165, 32);
+
+    pos(IDC_LBL_STATUS, 0, holdMode ? 343 : 275, designW, 20);
+
+    InvalidateRect(hWnd, NULL, TRUE);
+}
+
+LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    static HBRUSH hWinBgBrush = NULL, hInputBrush = NULL;
+
+    switch (msg) {
+    case WM_CREATE: {
+        BOOL darkValue = TRUE;
+        DwmSetWindowAttribute(hWnd, 20, &darkValue, sizeof(darkValue));
+
+        hWinBgBrush = CreateSolidBrush(CLR_BG);
+        hInputBrush = CreateSolidBrush(CLR_BTN_NORMAL);
+
+        auto makeBtn = [&](int id, LPCWSTR txt, HFONT f) {
+            HWND hBtn = CreateWindowW(L"BUTTON", txt, WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 10, 10, hWnd, (HMENU)id, NULL, NULL);
+            SetWindowSubclass(hBtn, ButtonSubclassProc, 0, 0);
+            SendMessageW(hBtn, WM_SETFONT, (WPARAM)f, TRUE);
+            return hBtn;
+            };
+
+        CreateWindowW(L"STATIC", L"ACTION MODE", WS_CHILD | WS_VISIBLE, 0, 0, 10, 10, hWnd, (HMENU)IDL_MODE, NULL, NULL);
+        makeBtn(IDC_BTN_TYPE_CLICK, L"Auto Click", g_hFontBtn);
+        makeBtn(IDC_BTN_TYPE_HOLD, L"Hold Key", g_hFontBtn);
+
+        CreateWindowW(L"STATIC", L"TARGET BUTTON", WS_CHILD | WS_VISIBLE, 0, 0, 10, 10, hWnd, (HMENU)IDL_TARGET, NULL, NULL);
+        makeBtn(IDC_BTN_MODE_LEFT, L"Left", g_hFontBtn);
+        makeBtn(IDC_BTN_MODE_RIGHT, L"Right", g_hFontBtn);
+        makeBtn(IDC_BTN_MODE_ALT, L"Alt", g_hFontBtn);
+
+        CreateWindowW(L"STATIC", L"SPEED (CPS)", WS_CHILD | WS_VISIBLE, 0, 0, 10, 10, hWnd, (HMENU)IDL_CPS, NULL, NULL);
+        makeBtn(IDC_BTN_MINUS, L"-", g_hFontEdit);
+        CreateWindowW(L"EDIT", L"10", WS_CHILD | WS_VISIBLE | ES_CENTER | ES_AUTOHSCROLL, 0, 0, 10, 10, hWnd, (HMENU)IDC_EDIT_CPS, NULL, NULL);
+        makeBtn(IDC_BTN_PLUS, L"+", g_hFontEdit);
+
+        CreateWindowW(L"STATIC", L"HOLD PAUSE (s)", WS_CHILD | WS_VISIBLE, 0, 0, 10, 10, hWnd, (HMENU)IDL_PAUSE, NULL, NULL);
+        makeBtn(IDC_BTN_PAUSE_MINUS, L"-", g_hFontEdit);
+        CreateWindowW(L"EDIT", L"0.1", WS_CHILD | WS_VISIBLE | ES_CENTER | ES_AUTOHSCROLL, 0, 0, 10, 10, hWnd, (HMENU)IDC_EDIT_PAUSE, NULL, NULL);
+        makeBtn(IDC_BTN_PAUSE_PLUS, L"+", g_hFontEdit);
+
+        CreateWindowW(L"STATIC", L"HOTKEYS", WS_CHILD | WS_VISIBLE, 0, 0, 10, 10, hWnd, (HMENU)IDL_KEYS, NULL, NULL);
+        makeBtn(IDC_BTN_BIND_TOGGLE, L"Toggle: [ F8 ]", g_hFontBtn);
+        makeBtn(IDC_BTN_BIND_EXIT, L"Exit: [ F9 ]", g_hFontBtn);
+
+        CreateWindowW(L"STATIC", L"○ STOPPED   |   Clicks: 0", WS_CHILD | WS_VISIBLE | SS_CENTER, 0, 0, 10, 10, hWnd, (HMENU)IDC_LBL_STATUS, NULL, NULL);
+
+        RebuildFonts(hWnd, 1.0f);
+        UpdateStatusUI();
+        break;
+    }
+
+    case WM_DRAWITEM: {
+        LPDRAWITEMSTRUCT pDIS = (LPDRAWITEMSTRUCT)lParam;
+        if (pDIS->CtlType == ODT_BUTTON) {
+            bool isPressed = (pDIS->itemState & ODS_SELECTED);
+            bool isHovered = (g_hHoveredBtn == pDIS->hwndItem);
+            wchar_t text[64];
+            GetWindowTextW(pDIS->hwndItem, text, 64);
+
+            COLORREF fill = CLR_BTN_NORMAL;
+            COLORREF textCol = CLR_TEXT;
+
+            int id = pDIS->CtlID;
+            bool isDisabled = (id == IDC_BTN_PAUSE_MINUS || id == IDC_BTN_PAUSE_PLUS) && (g_ActionType == 0);
+
+            if (isDisabled) {
+                fill = CLR_BTN_NORMAL;
+                textCol = CLR_DISABLED;
+            }
+            else if (id == IDC_BTN_TYPE_CLICK || id == IDC_BTN_TYPE_HOLD) {
+                bool isActive = (id == IDC_BTN_TYPE_CLICK && g_ActionType == 0) ||
+                    (id == IDC_BTN_TYPE_HOLD && g_ActionType == 1);
+                if (isActive) fill = CLR_ACCENT;
+                else fill = isPressed ? CLR_BTN_PRESS : (isHovered ? CLR_BTN_HOVER : CLR_BTN_NORMAL);
+            }
+            else if (id == IDC_BTN_MODE_LEFT || id == IDC_BTN_MODE_RIGHT || id == IDC_BTN_MODE_ALT) {
+                bool isActive = (id == IDC_BTN_MODE_LEFT && g_ClickMode == 0) ||
+                    (id == IDC_BTN_MODE_RIGHT && g_ClickMode == 1) ||
+                    (id == IDC_BTN_MODE_ALT && g_ClickMode == 2);
+                if (isActive) fill = CLR_ACCENT;
+                else fill = isPressed ? CLR_BTN_PRESS : (isHovered ? CLR_BTN_HOVER : CLR_BTN_NORMAL);
+            }
+            else if (id == IDC_BTN_BIND_TOGGLE || id == IDC_BTN_BIND_EXIT) {
+                bool isBinding = (g_BindingTarget == 1 && id == IDC_BTN_BIND_TOGGLE) ||
+                    (g_BindingTarget == 2 && id == IDC_BTN_BIND_EXIT);
+                if (isBinding) { fill = CLR_BINDING; textCol = RGB(0, 0, 0); }
+                else fill = isPressed ? CLR_BTN_PRESS : (isHovered ? CLR_BTN_HOVER : CLR_BTN_NORMAL);
+            }
+            else {
+                fill = isPressed ? CLR_BTN_PRESS : (isHovered ? CLR_BTN_HOVER : CLR_BTN_NORMAL);
+            }
+
+            HBRUSH hBg = CreateSolidBrush(CLR_BG);
+            FillRect(pDIS->hDC, &pDIS->rcItem, hBg);
+            DeleteObject(hBg);
+
+            HBRUSH hBrush = CreateSolidBrush(fill);
+            HPEN hPen = CreatePen(PS_SOLID, 1, fill);
+            HBRUSH oldB = (HBRUSH)SelectObject(pDIS->hDC, hBrush);
+            HPEN oldP = (HPEN)SelectObject(pDIS->hDC, hPen);
+
+            const int radius = (int)(8 * g_UiScale + 0.5f);
+            RoundRect(pDIS->hDC, pDIS->rcItem.left, pDIS->rcItem.top, pDIS->rcItem.right, pDIS->rcItem.bottom, radius, radius);
+
+            SetBkMode(pDIS->hDC, TRANSPARENT);
+            SetTextColor(pDIS->hDC, textCol);
+            SelectObject(pDIS->hDC, (HFONT)SendMessageW(pDIS->hwndItem, WM_GETFONT, 0, 0));
+            DrawTextW(pDIS->hDC, text, -1, &pDIS->rcItem, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+            SelectObject(pDIS->hDC, oldB);
+            SelectObject(pDIS->hDC, oldP);
+            DeleteObject(hBrush);
+            DeleteObject(hPen);
+            return TRUE;
+        }
+        break;
+    }
+
+    case WM_GETMINMAXINFO: {
+        LPMINMAXINFO lpMMI = (LPMINMAXINFO)lParam;
+        lpMMI->ptMinTrackSize.x = 400;
+        lpMMI->ptMinTrackSize.y = (g_ActionType == 1) ? 448 : 380;
+        break;
+    }
+
+    case WM_NCHITTEST: {
+        if (IsZoomed(hWnd) || IsIconic(hWnd))
+            return DefWindowProcW(hWnd, msg, wParam, lParam);
+
+        POINT pt = { (short)LOWORD(lParam), (short)HIWORD(lParam) };
+
+        // Only the four corners of the whole window are resize handles.
+        RECT wr;
+        GetWindowRect(hWnd, &wr);
+        const int corner = 20;
+        const bool winLeft = pt.x < wr.left + corner;
+        const bool winRight = pt.x >= wr.right - corner;
+        const bool winTop = pt.y < wr.top + corner;
+        const bool winBottom = pt.y >= wr.bottom - corner;
+
+        if (winTop && winLeft) return HTTOPLEFT;
+        if (winTop && winRight) return HTTOPRIGHT;
+        if (winBottom && winLeft) return HTBOTTOMLEFT;
+        if (winBottom && winRight) return HTBOTTOMRIGHT;
+
+        const LRESULT def = DefWindowProcW(hWnd, msg, wParam, lParam);
+        if (def == HTLEFT || def == HTRIGHT || def == HTTOP || def == HTBOTTOM)
+            return HTCLIENT;
+
+        return def;
+    }
+
+    case WM_SIZE: {
+        ApplyLayout(hWnd, LOWORD(lParam), HIWORD(lParam));
+        break;
+    }
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hWnd, &ps);
+
+        auto paintEditBg = [&](int editId, bool disabled) {
+            HWND hEdit = GetDlgItem(hWnd, editId);
+            if (!hEdit) return;
+            RECT rc;
+            GetWindowRect(hEdit, &rc);
+            MapWindowPoints(HWND_DESKTOP, hWnd, (LPPOINT)&rc, 2);
+            const int padX = (int)(5 * g_ScaleX + 0.5f);
+            const int padY = (int)(3 * g_ScaleY + 0.5f);
+            const int radius = (int)(8 * g_UiScale + 0.5f);
+            rc.left -= padX; rc.top -= padY; rc.right += padX; rc.bottom += padY;
+            HBRUSH brush = CreateSolidBrush(disabled ? CLR_BG : CLR_BTN_NORMAL);
+            SelectObject(hdc, brush);
+            SelectObject(hdc, GetStockObject(NULL_PEN));
+            RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
+            DeleteObject(brush);
+        };
+
+        paintEditBg(IDC_EDIT_CPS, false);
+        paintEditBg(IDC_EDIT_PAUSE, g_ActionType == 0);
+
+        // Corner resize grips
+        RECT client;
+        GetClientRect(hWnd, &client);
+        const int gl = 13;
+        const int go = 7;
+        HPEN gripPen = CreatePen(PS_SOLID, 1, RGB(96, 96, 108));
+        HPEN oldGripPen = (HPEN)SelectObject(hdc, gripPen);
+
+        auto drawCorner = [&](int x, int y, int dx, int dy) {
+            MoveToEx(hdc, x, y, NULL);
+            LineTo(hdc, x + dx * gl, y);
+            MoveToEx(hdc, x, y, NULL);
+            LineTo(hdc, x, y + dy * gl);
+        };
+        drawCorner(go, client.bottom - go - 1, 1, -1);
+        drawCorner(client.right - go - 1, client.bottom - go - 1, -1, -1);
+
+        SelectObject(hdc, oldGripPen);
+        DeleteObject(gripPen);
+
+        EndPaint(hWnd, &ps);
+        break;
+    }
+
+    case WM_CTLCOLORSTATIC: {
+        HDC hdcStatic = (HDC)wParam;
+        SetBkMode(hdcStatic, TRANSPARENT);
+        int id = GetDlgCtrlID((HWND)lParam);
+
+        if (id == IDC_LBL_STATUS) {
+            SetTextColor(hdcStatic, g_Running ? CLR_STATUS_RUN : CLR_TEXT_MUTED);
+            return (LRESULT)hWinBgBrush;
+        }
+        else if (id == IDL_PAUSE && g_ActionType == 0) {
+            SetTextColor(hdcStatic, CLR_DISABLED);
+            return (LRESULT)hWinBgBrush;
+        }
+        else if (id >= 200) {
+            SetTextColor(hdcStatic, CLR_TEXT_MUTED);
+            return (LRESULT)hWinBgBrush;
+        }
+        SetTextColor(hdcStatic, CLR_TEXT);
+        return (LRESULT)hWinBgBrush;
+    }
+
+    case WM_CTLCOLOREDIT: {
+        HDC hdcEdit = (HDC)wParam;
+        HWND hEdit = (HWND)lParam;
+        bool disabled = false;
+        if (hEdit == GetDlgItem(hWnd, IDC_EDIT_PAUSE)) disabled = (g_ActionType == 0);
+
+        if (disabled) {
+            SetBkColor(hdcEdit, CLR_BG);
+            SetTextColor(hdcEdit, CLR_DISABLED);
+            return (LRESULT)hWinBgBrush;
+        }
+        SetBkColor(hdcEdit, CLR_BTN_NORMAL);
+        SetTextColor(hdcEdit, CLR_TEXT);
+        return (LRESULT)hInputBrush;
+    }
+
+    case WM_USER + 1:
+        UpdateStatusUI();
+        break;
+
+    case WM_COMMAND: {
+        int id = LOWORD(wParam);
+
+        if (g_Running && (id == IDC_BTN_TYPE_CLICK || id == IDC_BTN_TYPE_HOLD)) break;
+
+        if (id == IDC_BTN_TYPE_CLICK || id == IDC_BTN_TYPE_HOLD) {
+            SetFocus(hWnd);
+            g_ActionType = (id == IDC_BTN_TYPE_CLICK) ? 0 : 1;
+
+            // Update section label
+            HWND hLbl = GetDlgItem(hWnd, IDL_CPS);
+            SetWindowTextW(hLbl, g_ActionType == 1 ? L"HOLD TIME (s)" : L"SPEED (CPS)");
+
+            // Sync edit contents to the active setting
+            HWND hEdit = GetDlgItem(hWnd, IDC_EDIT_CPS);
+            double mainVal = (g_ActionType == 1) ? g_HoldDuration.load() : g_Cps.load();
+            SetWindowTextW(hEdit, FormatSeconds(mainVal).c_str());
+
+            // Resize window → triggers WM_SIZE → shows/hides pause row + relayout
+            RECT wr;
+            GetWindowRect(hWnd, &wr);
+            int newH = (g_ActionType == 1) ? 448 : 380;
+            SetWindowPos(hWnd, NULL, 0, 0, wr.right - wr.left, newH, SWP_NOMOVE | SWP_NOZORDER);
+
+            UpdateStatusUI();
+            SaveSettings();
+        }
+        else if (IsRepeatableButton(id)) {
+            // Mouse clicks are handled on WM_LBUTTONDOWN (and repeated by a
+            // timer while held), so skip the duplicate BN_CLICKED. Keyboard
+            // activation still goes through here.
+            if (g_RepeatConsumed) {
+                g_RepeatConsumed = false;
+            }
+            else {
+                StepValue(id);
+            }
+        }
+        else if (id == IDC_BTN_MODE_LEFT || id == IDC_BTN_MODE_RIGHT || id == IDC_BTN_MODE_ALT) {
+            SetFocus(hWnd);
+            g_ClickMode = (id == IDC_BTN_MODE_LEFT) ? 0 : (id == IDC_BTN_MODE_RIGHT ? 1 : 2);
+            UpdateStatusUI();
+            SaveSettings();
+        }
+        else if (id == IDC_EDIT_CPS && HIWORD(wParam) == EN_CHANGE) {
+            wchar_t buf[32];
+            GetWindowTextW((HWND)lParam, buf, 32);
+            try {
+                double val = std::stod(buf);
+                if (val > 0.0) {
+                    if (g_ActionType == 1) g_HoldDuration = val;
+                    else g_Cps = val;
+                }
+            }
+            catch (...) {}
+            SaveSettings();
+        }
+        else if (id == IDC_EDIT_PAUSE && HIWORD(wParam) == EN_CHANGE) {
+            wchar_t buf[32];
+            GetWindowTextW((HWND)lParam, buf, 32);
+            try {
+                double val = std::stod(buf);
+                if (val >= 0.0) g_HoldPause = val;
+            }
+            catch (...) {}
+            SaveSettings();
+        }
+        else if (id == IDC_BTN_BIND_TOGGLE) {
+            SetFocus(hWnd);
+            g_BindingTarget = 1;
+            UpdateStatusUI();
+        }
+        else if (id == IDC_BTN_BIND_EXIT) {
+            SetFocus(hWnd);
+            g_BindingTarget = 2;
+            UpdateStatusUI();
+        }
+        break;
+    }
+
+    case WM_DESTROY:
+        SaveSettings();
+        g_Running = g_AppActive = false;
+        PostQuitMessage(0);
+        break;
+
+    default:
+        return DefWindowProcW(hWnd, msg, wParam, lParam);
+    }
+    return 0;
+}
+
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
+    SetProcessDPIAware();
+
+    INITCOMMONCONTROLSEX icex = { sizeof(INITCOMMONCONTROLSEX), ICC_STANDARD_CLASSES };
+    InitCommonControlsEx(&icex);
+
+    // Tải Icon chuẩn từ Resource
+    HICON hIconBig = (HICON)LoadImageW(hInstance, MAKEINTRESOURCE(IDI_ICON1), IMAGE_ICON, 32, 32, LR_DEFAULTCOLOR);
+    HICON hIconSmall = (HICON)LoadImageW(hInstance, MAKEINTRESOURCE(IDI_ICON1), IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR);
+
+    if (!hIconBig) hIconBig = LoadIcon(NULL, IDI_APPLICATION);
+    if (!hIconSmall) hIconSmall = hIconBig;
+
+    WNDCLASSEXW wc = { sizeof(WNDCLASSEXW) };
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = hInstance;
+    wc.lpszClassName = L"TuynfCompactSquareClass";
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = CreateSolidBrush(CLR_BG);
+    wc.hIcon = hIconBig;
+    wc.hIconSm = hIconSmall;
+
+    RegisterClassExW(&wc);
+
+    g_hWnd = CreateWindowExW(
+        0, wc.lpszClassName, L"Tuynf Auto Clicker",
+        WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT, 400, 448,
+        NULL, NULL, hInstance, NULL
+    );
+
+    LoadSettings();
+    g_SettingsReady = true;
+
+    // Resize window to match loaded action mode (triggers WM_SIZE relayout)
+    {
+        int initH = (g_ActionType == 1) ? 448 : 380;
+        RECT wr;
+        GetWindowRect(g_hWnd, &wr);
+        SetWindowPos(g_hWnd, NULL, 0, 0, wr.right - wr.left, initH, SWP_NOMOVE | SWP_NOZORDER);
+    }
+
+    UpdateStatusUI();
+
+    // Gửi thông điệp ép Windows hiển thị Icon lên thanh tiêu đề
+    SendMessageW(g_hWnd, WM_SETICON, ICON_BIG, (LPARAM)hIconBig);
+    SendMessageW(g_hWnd, WM_SETICON, ICON_SMALL, (LPARAM)hIconSmall);
+
+    ShowWindow(g_hWnd, nCmdShow);
+    UpdateWindow(g_hWnd);
+
+    g_hKbdHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, hInstance, 0);
+    g_hMouseHook = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc, hInstance, 0);
+
+    std::thread worker(ClickerThread);
+    MSG msg;
+    while (GetMessageW(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    if (g_hKbdHook) UnhookWindowsHookEx(g_hKbdHook);
+    if (g_hMouseHook) UnhookWindowsHookEx(g_hMouseHook);
+    if (worker.joinable()) worker.join();
+    return (int)msg.wParam;
+}
+
+int main() {
+    return wWinMain(GetModuleHandle(NULL), NULL, GetCommandLineW(), SW_SHOWDEFAULT);
+}

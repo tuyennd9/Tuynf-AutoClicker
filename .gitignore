@@ -1,0 +1,28 @@
+# Visual Studio
+.vs/
+x64/
+Debug/
+Release/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+*.tlog
+*.ipch
+
+# Build output
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.log
+
+# Local configuration
+settings.ini
+
+# Source assets kept outside the repository root layout
+Code_Generated_Image.png
+
+# OS files
+Thumbs.db
+Desktop.ini
